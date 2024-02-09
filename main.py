@@ -114,6 +114,10 @@ def main_loop():
     sw100 = StopWatch()
     looptime = StopWatch()
     nloops = 0
+
+    # TODO: jaguilar - Install a pid controller for the target angle. Error is distance from desired
+    # wheel rotation.
+
     while True:
         loopdelay = looptime.time()
         nloops += 1
