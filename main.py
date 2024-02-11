@@ -223,7 +223,7 @@ def main_loop():
         return target_angle - angle
 
     pid = PID(
-        target_angle, kp=50 / 3, ki=65, kd=0.2, min=-100, max=100, logname="mainpid"
+        target_angle, kp=40 / 3, ki=65, kd=0.065, min=-100, max=100, logname="mainpid"
     )
 
     sw100 = StopWatch()
