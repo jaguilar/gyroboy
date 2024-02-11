@@ -41,8 +41,46 @@ arm = Motor(Port.C)
 target_loop_ms = 5
 
 
+def get_calibrated_angle_speed():
+    """Returns a tuple of (angle, speed) of the gyro, both floats."""
+    CALIBRATION_TIME_MS = 2000
+    CALIBRATION_SAMPLE_TIME_MS = 15
+
+    sum, count = 0, int(CALIBRATION_TIME_MS / CALIBRATION_SAMPLE_TIME_MS)
+    for _ in range(count):
+        sum += gyro.speed()
+        wait(CALIBRATION_SAMPLE_TIME_MS)
+
+    drift_rate = sum / count
+    angle = 0
+
+    # Every time we sample the speed of the gyro, we'll update the average drift
+    # as an exponentially weighted moving average of the speed, with an alpha of 0.001
+    DRIFT_RATE_UPDATE_FRACTION = 0.001
+
+    def sample(dt: float):
+        nonlocal angle, drift_rate
+        raw_speed = gyro.speed()
+        speed = raw_speed - drift_rate
+
+        angle += speed * dt / 1000
+
+        # Gradually update the drift rate with the average of observed speeds.
+        # The assumption here is that the average speed should be zero so to the
+        # extent we see non-average speeds, we're drifting.
+        drift_rate = (
+            drift_rate * (1 - DRIFT_RATE_UPDATE_FRACTION)
+            + speed * DRIFT_RATE_UPDATE_FRACTION
+        )
+
+        return angle
+
+    return sample
+
+
 class Smoother:
-    def __init__(self, nelements=10):
+
+    def __init__(self, nelements=7):
         self._ring = [0] * nelements
         self._index = 0
 
@@ -52,10 +90,11 @@ class Smoother:
         if self._index == len(self._ring):
             self._index = 0
 
-    def diff(self):
+    def avg(self):
         """Returns the difference between the latest observation and the earliest."""
+        # The earliest observation is the ring index we're currently pointing at.
         latest = self._index - 1 if self._index != 0 else len(self._ring) - 1
-        return self._ring[latest] - self._ring[self._index]
+        return (self._ring[latest] - self._ring[self._index]) / len(self._ring)
 
 
 def errintegral(errf):
@@ -80,6 +119,7 @@ def clamp(x, min, max):
 
 def pid_controller(
     errf,  # Callable[[], int]
+    dtf,
     initial_value: float = 0.0,
     kp: float = 0,
     ki: float = 0,
@@ -88,7 +128,10 @@ def pid_controller(
     logname=None,
 ):
     smoothed_err = Smoother()
-    smoothed_t = Smoother()
+
+    # Note that the integral component is multiplied by dt in milliseconds, which means
+    # that without scaling ki down by 1000 it will be of a different scale than kd and kp.
+    ki /= 1000.0
 
     err_integral = 0.0
     max_abs_err_integral = None
@@ -98,18 +141,9 @@ def pid_controller(
         output_width = output_range[1] - output_range[0]
         max_abs_err_integral = output_width / ki
 
-    # We apply corrections according to dt, which will be in millseconds. But we want
-    # callers to reason in terms of per-second rates. Therefore, we divide all our constants
-    # by 1000 so that the total correction applied per second is as expected. For example,
-    # if the target angle setpoint is 1 and the actual angle is 0 and kp is 1, then we would expect
-    # an output adjustment of 1 per second while the error remains fixed, no matter what sample
-    # rate we have.
-    kp /= 1000.0
-    ki /= 1000.0
-    kd /= 1000.0
-
-    last_t = 0
-    timer = StopWatch()
+    # Note that our raw derr/dt is calculated per millisecond. To allow the calculation
+    # to be of the same scale as ki and kp, multiply by 1000.
+    kd *= 1000.0
 
     log_index = 0
     log_timer = StopWatch()
@@ -121,7 +155,6 @@ def pid_controller(
             "p",
             "i",
             "d",
-            "correction",
             "output",
             name=logname,
             timestamp=False,
@@ -129,17 +162,12 @@ def pid_controller(
         if logname
         else None
     )
+
     while True:
         err = errf()
-        t = timer.time()
-        dt = t - last_t
-        last_t = t
-
-        if dt == 0:
-            # We do not update if no time has passed
-            yield output
 
         p = err * kp
+        dt = dtf()
 
         i = 0
         if ki != 0:
@@ -152,27 +180,20 @@ def pid_controller(
 
         d = 0
         if kd != 0:
-            # Record the smoothed error and time, then calculate d.
             smoothed_err.update(err)
-            smoothed_t.update(t)
-            sderr = smoothed_err.diff()
-            sdt = smoothed_t.diff()
-            d = kd * float(sderr) / sdt
+            sderr = smoothed_err.avg()
+            d = kd * float(sderr) / dt
 
-        correction = p + i + d
-        output += dt * correction
+        output = p + i + d
         output = clamp(output, output_range[0], output_range[1])
 
         if log and log_timer.time() > 50:
-            # Note that we multiply p i d and correction by 1000 to get the per-second
-            # values.
             log.log(
                 log_index,
                 err,
-                p * 1000,
-                i * 1000,
-                d * 1000,
-                correction * 1000,
+                p,
+                i,
+                d,
                 output,
             )
             log_timer.reset()
@@ -180,35 +201,10 @@ def pid_controller(
         yield output
 
 
-def calibrate_gyro():
-    sw = StopWatch()
-    start_angle = gyro.angle()
-    drift_rate_sum = 0.0
-    drift_rate_samples = 0
-    while sw.time() < 2000:
-        wait(5)
-        drift = gyro.angle() - start_angle
-        drift_per_milli = float(drift) / sw.time()
-        drift_rate_sum += drift_per_milli
-        drift_rate_samples += 1
-    average_drift_per_milli = drift_rate_sum / drift_rate_samples
-    print(average_drift_per_milli)
-
-    sw.reset()
-    gyro.reset_angle(0)
-
-    def true_angle():
-        return gyro.angle() - sw.time() * average_drift_per_milli
-
-    return true_angle
-
-
 def main_loop():
     sw = StopWatch()
 
-    # During the time we're going to observe the rate of gyro drift. We will subsequently
-    # measure the actual angle as angle() - drift_rate * time.
-    angle = calibrate_gyro()
+    get_angle = get_calibrated_angle_speed()
     ev3.speaker.beep()
 
     # We want the motors to rotate forward one full revolution. I.e. the robot should
@@ -218,14 +214,20 @@ def main_loop():
     def motor_error():
         return desired_total_travel - (lleg.angle() + rleg.angle())
 
+    avg_loop_ms = target_loop_ms
+
+    angle = 0
+    anglelog = DataLog("angle", timestamp=False, name="anglelog")
+
     # output_range is assuming we started within 10 degrees of vertical.
     anglepid = pid_controller(
         motor_error,
-        kp=0.0001,
-        ki=0.0000005,
+        dtf=lambda: avg_loop_ms,
+        kp=1 / 720,
+        ki=0,
         kd=0,
         logname="anglepid",
-        output_range=(-10, 10),
+        output_range=(-5, 5),
     )
 
     # Minimize the difference between the total travel of the motors and the desired total
@@ -243,14 +245,14 @@ def main_loop():
     target_angle = 0.0
 
     def difference_from_desired_angle():
-        target_angle = 1
-        return target_angle - angle()
+        return target_angle - angle
 
     pid = pid_controller(
         difference_from_desired_angle,
-        kp=25,
-        ki=0.1,
-        kd=0,
+        dtf=lambda: avg_loop_ms,
+        kp=22.5,
+        ki=200,
+        kd=0.75,
         output_range=(-100, 100),
         logname="mainpid",
     )
@@ -261,14 +263,16 @@ def main_loop():
     total_loop_time = StopWatch()
 
     while True:
-        nloops += 1
+        angle = get_angle(avg_loop_ms)
+        anglelog.log(angle)
+        target_angle = next(anglepid)
 
         # If we want to tilt toward the positive angle, we need to drive the wheels
         # in reverse, hence the negative.
-        target_angle = next(anglepid)
-        output = -int(next(pid))
-        lleg.dc(round(output))
-        rleg.dc(round(output))
+
+        output = -round(next(pid))
+        lleg.dc(output)
+        rleg.dc(output)
 
         if abs(output) < 100:
             sw100.reset()
@@ -278,14 +282,17 @@ def main_loop():
                 % (float(total_loop_time.time()) / nloops,)
             )
             return
-        if abs(angle()) > 45:
+        if angle > 20:
             print(
-                "gyro detected at >45 offset, we crashed! %f loop time ms avg"
+                "angle limit exceeded, we crashed! %f loop time ms avg"
                 % (float(total_loop_time.time()) / nloops,)
             )
             return
         wait(max(0, target_loop_ms - loopwatch.time()))
         loopwatch.reset()
+
+        nloops += 1
+        avg_loop_ms = total_loop_time.time() / nloops
 
 
 if __name__ == "__main__":
