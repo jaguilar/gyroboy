@@ -230,18 +230,6 @@ def main_loop():
         output_range=(-5, 5),
     )
 
-    # Minimize the difference between the total travel of the motors and the desired total
-    # travel. This is going to be interpreted as an increment on the desire angle.
-    # So, for example, if we haven't travelled as far as we want to, then we want put upward
-    # pressure on the target angle.
-    #
-    # Note that this does not feed directly into the angle error function! This is an *increment*
-    # on the target angle each time through the loop. So the values should be fairly small. We
-    # structure it this way so that this error can act as a calibration function. If we are steady
-    # at our desired level of motor rotation, and the difference between the current angle and the
-    # target angle is zero, then this will be zero (ish, not counting the integral component), but
-    # the target angle may still be positive, since the robot starts leaning slightly back from its
-    # center of gravity.
     target_angle = 0.0
 
     def difference_from_desired_angle():
