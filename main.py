@@ -41,6 +41,119 @@ arm = Motor(Port.C)
 target_loop_ms = 5
 
 
+def clamp(x, min, max):
+    if x < min:
+        return min
+    if x > max:
+        return max
+    return x
+
+
+class Smoother:
+
+    def __init__(self, nelements=7):
+        self._ring = [0] * nelements
+        self._index = 0
+
+    def add(self, n):
+        self._ring[self._index] = n
+        self._index += 1
+        if self._index == len(self._ring):
+            self._index = 0
+
+    def diff(self):
+        """Returns the difference between the latest observation and the earliest."""
+        # The earliest observation is the ring index we're currently pointing at.
+        latest = self._index - 1 if self._index != 0 else len(self._ring) - 1
+        return self._ring[latest] - self._ring[self._index]
+
+    def __len__(self):
+        return len(self._ring)
+
+
+class PID:
+    def __init__(self, setpoint, kp, ki, kd, min, max, logname=None, logfreq=0.05):
+        """Initializes the PID controller.
+
+        setpoint: the target value.
+        kp: The proportional coefficient.
+        ki: The integral coefficient
+        kd: The differential coefficient
+        min: The minimum output value.
+        max: The maximum output value.
+        """
+        self._kp = kp
+        self._ki = ki
+        self._kd = kd
+        self._min = min
+        self._max = max
+        self.setpoint = float(setpoint)
+
+        # Data for integral part.
+        if self._ki != 0:
+            self._errsum = 0
+            minmax_diff = max - min
+            self._errsum_cap = minmax_diff / self._ki
+
+        # Data for derivative part.
+        if self._kd != 0:
+            self._err_tracker = Smoother()
+
+        self._log = None
+        if logname is not None:
+            self._log = (
+                DataLog(
+                    "index",
+                    "err",
+                    "p",
+                    "i",
+                    "d",
+                    "output",
+                    name=logname,
+                    timestamp=False,
+                )
+                if logname
+                else None
+            )
+            self._logfreq = logfreq
+            self._logindex = 0
+            self._until_log = 0.0
+
+    def update(self, measured, dt):
+        """Update the PID controller.
+
+        measured: The measured value of the system.
+        dt: The change in time, in seconds.
+        """
+        err = self.setpoint - measured
+
+        p = self._kp * err
+
+        i = 0
+        if self._ki != 0:
+            self._errsum = clamp(
+                self._errsum + err * dt, -self._errsum_cap, self._errsum_cap
+            )
+            i = self._errsum * self._ki
+
+        d = 0.0
+        if self._kd != 0:
+            self._err_tracker.add(err)
+            derr_dt = self._err_tracker.diff() / (len(self._err_tracker) * dt)
+            d = derr_dt * self._kd
+
+        output = clamp(p + i + d, self._min, self._max)
+
+        if self._log is not None:
+            self._until_log -= dt
+            if self._until_log < 0:
+                self._until_log = self._logfreq
+                self._log.log(self._logindex, err, p, i, d, output)
+                self._logindex += 1
+
+        return output
+
+
 def get_calibrated_angle_speed():
     """Returns a tuple of (angle, speed) of the gyro, both floats."""
     CALIBRATION_TIME_MS = 2000
@@ -63,7 +176,7 @@ def get_calibrated_angle_speed():
         raw_speed = gyro.speed()
         speed = raw_speed - drift_rate
 
-        angle += speed * dt / 1000
+        angle += speed * dt
 
         # Gradually update the drift rate with the average of observed speeds.
         # The assumption here is that the average speed should be zero so to the
@@ -78,129 +191,6 @@ def get_calibrated_angle_speed():
     return sample
 
 
-class Smoother:
-
-    def __init__(self, nelements=7):
-        self._ring = [0] * nelements
-        self._index = 0
-
-    def update(self, n):
-        self._ring[self._index] = n
-        self._index += 1
-        if self._index == len(self._ring):
-            self._index = 0
-
-    def avg(self):
-        """Returns the difference between the latest observation and the earliest."""
-        # The earliest observation is the ring index we're currently pointing at.
-        latest = self._index - 1 if self._index != 0 else len(self._ring) - 1
-        return (self._ring[latest] - self._ring[self._index]) / len(self._ring)
-
-
-def errintegral(errf):
-    sw = StopWatch()
-    sum = 0
-    last_t = 0
-    while True:
-        t = sw.time()
-        dt = t - last_t
-        last_t = t
-        sum += (errf() * t) / 1000.0
-        yield sum
-
-
-def clamp(x, min, max):
-    if x < min:
-        return min
-    if x > max:
-        return max
-    return x
-
-
-def pid_controller(
-    errf,  # Callable[[], int]
-    dtf,
-    initial_value: float = 0.0,
-    kp: float = 0,
-    ki: float = 0,
-    kd: float = 0,
-    output_range=(None, None),
-    logname=None,
-):
-    smoothed_err = Smoother()
-
-    # Note that the integral component is multiplied by dt in milliseconds, which means
-    # that without scaling ki down by 1000 it will be of a different scale than kd and kp.
-    ki /= 1000.0
-
-    err_integral = 0.0
-    max_abs_err_integral = None
-    if ki != 0 and output_range[0] is not None and output_range[1] is not None:
-        # Configure a maximum error integral such that the correction applied
-        # per 100ms will be the maximum span of the output.
-        output_width = output_range[1] - output_range[0]
-        max_abs_err_integral = output_width / ki
-
-    # Note that our raw derr/dt is calculated per millisecond. To allow the calculation
-    # to be of the same scale as ki and kp, multiply by 1000.
-    kd *= 1000.0
-
-    log_index = 0
-    log_timer = StopWatch()
-    output = initial_value
-    log = (
-        DataLog(
-            "index",
-            "err",
-            "p",
-            "i",
-            "d",
-            "output",
-            name=logname,
-            timestamp=False,
-        )
-        if logname
-        else None
-    )
-
-    while True:
-        err = errf()
-
-        p = err * kp
-        dt = dtf()
-
-        i = 0
-        if ki != 0:
-            err_integral += err * dt
-            if max_abs_err_integral is not None:
-                err_integral = clamp(
-                    err_integral, -max_abs_err_integral, max_abs_err_integral
-                )
-            i = ki * err_integral
-
-        d = 0
-        if kd != 0:
-            smoothed_err.update(err)
-            sderr = smoothed_err.avg()
-            d = kd * float(sderr) / dt
-
-        output = p + i + d
-        output = clamp(output, output_range[0], output_range[1])
-
-        if log and log_timer.time() > 50:
-            log.log(
-                log_index,
-                err,
-                p,
-                i,
-                d,
-                output,
-            )
-            log_timer.reset()
-            log_index += 1
-        yield output
-
-
 def main_loop():
     sw = StopWatch()
 
@@ -209,40 +199,31 @@ def main_loop():
 
     # We want the motors to rotate forward one full revolution. I.e. the robot should
     # roll itself off the stand. The travel is the sum of the leg travel so.
-    desired_total_travel = 720
+    desired_motor_angle_sum = 720
 
-    def motor_error():
-        return desired_total_travel - (lleg.angle() + rleg.angle())
+    def motor_angle_sum():
+        return lleg.angle() + rleg.angle()
 
-    avg_loop_ms = target_loop_ms
+    avg_loop_s = target_loop_ms / 1000
 
     angle = 0
-    anglelog = DataLog("angle", timestamp=False, name="anglelog")
+    motor_angle_history = Smoother()
 
-    # output_range is assuming we started within 10 degrees of vertical.
-    anglepid = pid_controller(
-        motor_error,
-        dtf=lambda: avg_loop_ms,
-        kp=1 / 720,
-        ki=0,
-        kd=0,
-        logname="anglepid",
-        output_range=(-5, 5),
-    )
+    def get_smoothed_motor_angular_velocity(dt):
+        motor_angle_history.add(motor_angle_sum())
+        return motor_angle_history.diff() / (dt * len(motor_angle_history))
+
+    # For initial testing, we want a motorspeed of zero. The angle
+    # will controll the motor speed.
+    angle_by_motorspeed = PID(0, kp=1 / 5000, ki=1 / 2500, kd=1 / 100000, min=-5, max=5)
 
     target_angle = 0.0
 
     def difference_from_desired_angle():
         return target_angle - angle
 
-    pid = pid_controller(
-        difference_from_desired_angle,
-        dtf=lambda: avg_loop_ms,
-        kp=22.5,
-        ki=200,
-        kd=0.75,
-        output_range=(-100, 100),
-        logname="mainpid",
+    pid = PID(
+        target_angle, kp=50 / 3, ki=65, kd=0.2, min=-100, max=100, logname="mainpid"
     )
 
     sw100 = StopWatch()
@@ -250,15 +231,32 @@ def main_loop():
     nloops = 0
     total_loop_time = StopWatch()
 
+    logger = DataLog("desired_speed", name="desired_speed_log", timestamp=False)
     while True:
-        angle = get_angle(avg_loop_ms)
-        anglelog.log(angle)
-        target_angle = next(anglepid)
+        angle = get_angle(avg_loop_s)
+
+        # Compute the desired motor angular velocity. We want have a revolution per
+        # second toward the desired position when the motor is 4 full revolutions away
+        # from the desired position, and no more. We linearly interpolate between that
+        # speed and zero when the motor is close to its initial position.
+        # (This is just a P controller, but it's simpler to do it here in plain code.)
+        revolutions_from_desired_position = (
+            desired_motor_angle_sum - motor_angle_sum()
+        ) / (4 * 720.0)
+        # Note that 360 means half a revolution, since it's the sum of the angles.
+        desired_speed = float(clamp(revolutions_from_desired_position * 360, -360, 360))
+        logger.log(desired_speed)
+
+        angle_by_motorspeed.setpoint = desired_speed
+        target_angle = angle_by_motorspeed.update(
+            get_smoothed_motor_angular_velocity(avg_loop_s), avg_loop_s
+        )
 
         # If we want to tilt toward the positive angle, we need to drive the wheels
         # in reverse, hence the negative.
+        pid.setpoint = target_angle
+        output = -round(pid.update(angle, avg_loop_s))
 
-        output = -round(next(pid))
         lleg.dc(output)
         rleg.dc(output)
 
@@ -280,7 +278,7 @@ def main_loop():
         loopwatch.reset()
 
         nloops += 1
-        avg_loop_ms = total_loop_time.time() / nloops
+        avg_loop_s = total_loop_time.time() / nloops / 1000
 
 
 if __name__ == "__main__":
