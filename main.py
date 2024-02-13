@@ -185,11 +185,13 @@ def get_calibrated_angle_speed():
 
         # Gradually update the drift rate with the average of observed speeds.
         # The assumption here is that the average speed should be zero so to the
-        # extent we see non-average speeds, we're drifting.
-        drift_rate = (
-            drift_rate * (1 - DRIFT_RATE_UPDATE_FRACTION)
-            + speed * DRIFT_RATE_UPDATE_FRACTION
-        )
+        # extent we see non-average speeds, we're drifting. If we found absolutely
+        # zero drift during initial calibration, don't update the fraction.
+        if drift_rate != 0.0:
+            drift_rate = (
+                drift_rate * (1 - DRIFT_RATE_UPDATE_FRACTION)
+                + speed * DRIFT_RATE_UPDATE_FRACTION
+            )
 
         return angle
 
