@@ -51,7 +51,7 @@ def clamp(x, min, max):
 
 class Smoother:
 
-    def __init__(self, nelements=7):
+    def __init__(self, nelements=4):
         self._ring = [0] * nelements
         self._index = 0
 
@@ -72,6 +72,7 @@ class Smoother:
 
 
 class PID:
+
     def __init__(self, setpoint, kp, ki, kd, min, max, logname=None, logfreq=0.05):
         """Initializes the PID controller.
 
@@ -100,11 +101,13 @@ class PID:
             self._err_tracker = Smoother()
 
         self._log = None
+        self._t = 0.0
         if logname is not None:
             self._log = (
                 DataLog(
-                    "index",
-                    "err",
+                    "t",
+                    "setpoint",
+                    "observation",
                     "p",
                     "i",
                     "d",
@@ -118,6 +121,7 @@ class PID:
             self._logfreq = logfreq
             self._logindex = 0
             self._until_log = 0.0
+            self._t = 0.0
 
     def update(self, measured, dt):
         """Update the PID controller.
@@ -126,6 +130,7 @@ class PID:
         dt: The change in time, in seconds.
         """
         err = self.setpoint - measured
+        self._t += dt
 
         p = self._kp * err
 
@@ -148,7 +153,7 @@ class PID:
             self._until_log -= dt
             if self._until_log < 0:
                 self._until_log = self._logfreq
-                self._log.log(self._logindex, err, p, i, d, output)
+                self._log.log(self._t, self.setpoint, measured, p, i, d, output)
                 self._logindex += 1
 
         return output
@@ -169,7 +174,7 @@ def get_calibrated_angle_speed():
 
     # Every time we sample the speed of the gyro, we'll update the average drift
     # as an exponentially weighted moving average of the speed, with an alpha of 0.001
-    DRIFT_RATE_UPDATE_FRACTION = 0.001
+    DRIFT_RATE_UPDATE_FRACTION = 0.000005
 
     def sample(dt: float):
         nonlocal angle, drift_rate
@@ -215,7 +220,9 @@ def main_loop():
 
     # For initial testing, we want a motorspeed of zero. The angle
     # will controll the motor speed.
-    angle_by_motorspeed = PID(0, kp=1 / 5000, ki=1 / 2500, kd=1 / 100000, min=-5, max=5)
+    angle_by_motorspeed = PID(
+        0, kp=1 / 1500, ki=1 / 100, kd=1 / 10000, min=-15, max=15, logname="anglepid"
+    )
 
     target_angle = 0.0
 
@@ -223,7 +230,7 @@ def main_loop():
         return target_angle - angle
 
     pid = PID(
-        target_angle, kp=40 / 3, ki=65, kd=0.065, min=-100, max=100, logname="mainpid"
+        target_angle, kp=40 / 3, ki=100, kd=1.0, min=-100, max=100, logname="mainpid"
     )
 
     sw100 = StopWatch()
@@ -245,7 +252,6 @@ def main_loop():
         ) / (4 * 720.0)
         # Note that 360 means half a revolution, since it's the sum of the angles.
         desired_speed = float(clamp(revolutions_from_desired_position * 360, -360, 360))
-        logger.log(desired_speed)
 
         angle_by_motorspeed.setpoint = desired_speed
         target_angle = angle_by_motorspeed.update(
