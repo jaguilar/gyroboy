@@ -222,25 +222,20 @@ def main_loop():
 
     # For initial testing, we want a motorspeed of zero. The angle
     # will controll the motor speed.
-    angle_by_motorspeed = PID(
-        0, kp=1 / 1500, ki=1 / 100, kd=1 / 10000, min=-15, max=15, logname="anglepid"
-    )
+    angle_by_motorspeed = PID(0, kp=1 / 1500, ki=1 / 100, kd=1 / 10000, min=-15, max=15)
 
     target_angle = 0.0
 
     def difference_from_desired_angle():
         return target_angle - angle
 
-    pid = PID(
-        target_angle, kp=40 / 3, ki=100, kd=1.0, min=-100, max=100, logname="mainpid"
-    )
+    pid = PID(target_angle, kp=40 / 3, ki=100, kd=1.0, min=-100, max=100)
 
     sw100 = StopWatch()
     loopwatch = StopWatch()
     nloops = 0
     total_loop_time = StopWatch()
 
-    logger = DataLog("desired_speed", name="desired_speed_log", timestamp=False)
     while True:
         angle = get_angle(avg_loop_s)
 
