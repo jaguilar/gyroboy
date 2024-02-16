@@ -1,9 +1,16 @@
+#!/usr/bin/env pybricks-micropython
+
+import array
 import math
 import micropython
 from micropython import const
+import sys
 
+is_micropython = sys.implementation.name == "micropython"
+ptr32 = (lambda x: x) if not is_micropython else ptr32
 
-@micropython.viper
+u4_array = lambda x: bytearray(4 * x) if is_micropython else [0] * x
+
 def clamp(x: float, min: float, max: float):
     if x < min:
         return min
@@ -15,20 +22,23 @@ def clamp(x: float, min: float, max: float):
 class Smoother:
 
     def __init__(self, nelements=4):
-        self._ring = [0] * nelements
+        self._ring = array.array("l", [0] * nelements)
         self._index = 0
 
+    @micropython.native
     def add(self, n):
-        self._ring[self._index] = n
-        self._index += 1
-        if self._index == len(self._ring):
-            self._index = 0
+        index = self._index
+        ring = self._ring
+        ring[index] = n
+        index += 1
+        if index == len(ring):
+            index = 0
+        self._index = index
 
-    def diff(self):
-        """Returns the difference between the latest observation and the earliest."""
-        # The earliest observation is the ring index we're currently pointing at.
-        latest = self._index - 1 if self._index != 0 else len(self._ring) - 1
-        return self._ring[latest] - self._ring[self._index]
+    @micropython.native
+    def oldest(self):
+        """Returns the oldest observation."""
+        return self._ring[self._index]
 
     def __len__(self):
         return len(self._ring)
@@ -128,13 +138,17 @@ class PID:
 
 def make_log2_ratio(f: float, input_magnitude: float, goodrelerr=0.001):
     # We can store values up to 2^31 - 1 (leaving a bit for the sign).
+    def error(f, num, denom):
+        return math.fabs(f - (num / denom)) / f
+
     if f == 0.0:
         return 0, 0
-    max_num_times_input = const(2**31 - 1)
-    bestseen = 1
-    for log2_denom in range(0):
+    max_num_times_input = const(2147483647)  # 2**32 - 1
+    bestnum, bestdenom = int(f), 1
+    bestseen = error(f, bestnum, bestdenom)
+    for log2_denom in range(32):
         denom = 1 << log2_denom
-        num = int(f * denom)
+        num = round(f * denom)
         if num * input_magnitude > max_num_times_input:
             break
         relerr = math.fabs(f - (num / denom)) / f
@@ -142,11 +156,18 @@ def make_log2_ratio(f: float, input_magnitude: float, goodrelerr=0.001):
             return num, log2_denom
         elif relerr < bestseen:
             bestseen = relerr
+            bestnum = num
+            bestdenom = denom
     raise Exception(
-        "No good int scaler for {0} {1} {2} best seen ratio {3}".format(
-            f, input_magnitude, goodrelerr, bestseen
+        "No good int scaler for {0} {1} {2} best seen ratio {3} {4}/{5}".format(
+            f, input_magnitude, goodrelerr, bestseen, bestnum, bestdenom
         )
     )
+
+
+@micropython.viper
+def log2_ratio_mul(n: int, num: int, shr: int) -> int:
+    return (n * num) >> shr
 
 
 class IntPID:
@@ -166,23 +187,23 @@ class IntPID:
         self,
         setpoint: int,
         max_expected_abs_err: float,
-        kp: float,
-        integral_time: float,  # In terms of dt's units.
-        derivative_time: float,
         min: int,
         max: int,
+        gain: float,
+        integral_time: float = 0,  # In terms of dt's units.
+        derivative_time: float = 0,
         logname=None,
         maxdt=20,
         logfreq=50,
         logfunc=None,
-        maxrelerr=0.001,
+        maxrelerr=0.02,
     ):
         """Initializes the PID controller.
 
         setpoint: the target value.
         max_expected_abs_err: the maximum difference between the setpoint and the error that we expect to see. This influences
           The choice of coefficient approximation ratios.
-        kp: The proportional coefficient.
+        gain: The controller gain.
         integrator_time: Holding error constant, the hypothetical time it requires i to be equal to p, in terms of dt's unit.
         differentiator_time: Starting from zero and holding the change in error constant, how long it takes for p to be equal to
           d, in terms of dt's unit.
@@ -193,17 +214,18 @@ class IntPID:
         maxrelerr: The maximum calculated relative error between the requested k values and their integer ratio approximations.
         """
         self._kp_num, self._kp_shr = make_log2_ratio(
-            kp, max_expected_abs_err, maxrelerr
+            gain, max_expected_abs_err, maxrelerr
         )
 
         self._min = min
         self._max = max
-        self.setpoint = float(setpoint)
+        self.setpoint = setpoint
 
         # Data for integral part.
-        ki = 1 / integral_time
-        self._ki_num, self._ki_shift = 0, 0
-        if ki != 0:
+
+        self._ki_num, self._ki_shr, self._errsum = 0, 0, 0
+        if integral_time != 0:
+            ki = gain / integral_time
             # Determine the largest possible integrator multiplier we're going to face.
             # Back-calculation will be used to suppress excessively large integrator
             # multipliers when output is saturated.
@@ -211,28 +233,27 @@ class IntPID:
             # p and d are maximally negative and i is maximally positive.
             # The error sum needs to be
             output_range = max - min
-            max_i = (
-                3 * output_range
-            )  # p and d will generally not exceed width of the output range, to reach an output of max, i will rarely need to be more than 3x the range.
+            max_i = output_range
             self._max_errsum = int(max_i / ki)
             self._ki_num, self._ki_shr = make_log2_ratio(
                 ki, self._max_errsum, maxrelerr
             )
+            self._errsum = 0
 
         # Data for derivative part.
-        self._kd_num, self._kd_shift = 0, 0
+        self._kd_num, self._kd_shr = 0, 0
         if derivative_time != 0:
-            self._err_buf = bytearray(4 * IntPID.errbuf_len)  # 4 samples, 32 bits wide
-            self._t_buf = bytearray(4 * IntPID.errbuf_len)  # 4 samples, 32 bits wide
+            self._err_buf = u4_array(IntPID.errbuf_len)  # 4 samples, 32 bits wide
+            self._t_buf = u4_array(IntPID.errbuf_len)  # 4 samples, 32 bits wide
             self._buf_next = 0
             # Incorporate the errbuf len divide into the ratio.
             derivative_time /= IntPID.errbuf_len
             self._kd_num, self._kd_shr = make_log2_ratio(
-                derivative_time, 2 * max_expected_abs_err * maxdt, maxrelerr
+                gain * derivative_time, 2 * max_expected_abs_err * maxdt, maxrelerr
             )
 
-        self._t = 0
-        self._nextlog = self._logfreq = logfreq
+        self._nextlog = self._t = 0
+        self._logfreq = logfreq
         self._store_intermediate = False
         if logfunc:
             self._logfunc = logfunc
@@ -254,8 +275,8 @@ class IntPID:
         else:
             self._logfunc = None
 
-    @micropython.viper
-    def _update(self, measured, dt):
+    @micropython.native
+    def _update(self, measured: int, dt: int):
         """Update the PID controller.
 
         measured: The measured value of the system.
@@ -271,22 +292,16 @@ class IntPID:
             int(self._kd_shr),
         )
 
-        err = self.setpoint - measured
+        err = int(self.setpoint) - int(measured)
         p = 0
         if kp_num != 0:
-            p = (err * kp_num) >> kp_shr
+            p = err * kp_num
+            p >>= kp_shr
 
         i = 0
+        errsum = int(self._errsum)
         if ki_num != 0:
-            max_errsum = int(self._max_errsum)
-            min_errsum = 0 - max_errsum
-            errsum = self._errsum
             errsum += err * dt
-            if errsum > max_errsum:
-                errsum = max_errsum
-            if errsum < min_errsum:
-                errsum = min_errsum
-            self._errsum = errsum
             i = (errsum * ki_num) >> ki_shr
 
         d = 0
@@ -298,28 +313,33 @@ class IntPID:
 
             # Make buf_next point to the oldest value -- the one to next be overwritten.
             buf_next += 1
-            if buf_next > IntPID.errbuf_len:
+            if buf_next >= IntPID.errbuf_len:
                 buf_next = 0
 
             self._buf_next = buf_next
 
-            derr = err - err_buf[err_buf]
-            dt = sum(t_buf)
+            derr = err - err_buf[buf_next]
+            dt_deriv = sum(t_buf)
 
-            d = derr * kd_num / (dt << kd_shr)
+            d = derr * kd_num // (dt_deriv << kd_shr)
 
         output = p + i + d
-        if output < self._min:
-            output = self._min
-        if output > self._max:
-            output = self._max
+        min, max = self._min, self._max
+        if output < min:
+            output = min
+            errsum -= err * dt  # Anti-windup clamping.
+        elif output > max:
+            output = max
+            errsum -= err * dt
+
+        # Write-back errsum.
+        self._errsum = errsum
 
         if self._store_intermediate:
             self._p, self._i, self._d = p, i, d
-
         return output
 
-    def update(self, measured, dt):
+    def update(self, measured: int, dt: int):
         if self._logfunc:
             self._t += dt
             if self._t > self._nextlog:
