@@ -62,46 +62,69 @@ ANGLE_SCALE = const(10)  # Decidegrees
 # Returns a function that, given a dt, reports the angle of the gyro in millidegrees.
 def get_calibrated_angle_speed():
     """Returns a tuple of (angle, speed) of the gyro, both floats."""
-    CALIBRATION_TIME_MS = 2000
-    CALIBRATION_SAMPLE_TIME_MS = 15
-    EXTRA_PRECISION = const(4)
+    CALIBRATION_TIME_MS = const(2000)
+    CALIBRATION_SAMPLE_TIME_MS = const(15)
+    PRECBITS = const(
+        10
+    )  # Internal state is represented with 10 extra bits of precision.
+    SCALE = const(1000)
 
-    sum, count = 0, int(CALIBRATION_TIME_MS / CALIBRATION_SAMPLE_TIME_MS)
+    # This ratio scales speed into millidegrees/sec in the extra precision level
+    # given by PRECBITS. (Dividing by scale gives millidegrees.)
+    SPEED_SCALE_NUM, SPEED_SCALE_SHR = make_log2_ratio(PRECBITS / SCALE, 360)
+
+    sum, count = 0, 0
     for _ in range(count):
-        sum += gyro.speed()
+        sum += gyro.speed() * SCALE
         wait(CALIBRATION_SAMPLE_TIME_MS)
 
-    # Within this function, angles and speeds are stored as value << 10.
-    # We scale this down to deci-degrees on output.
-    calibration_time_s = CALIBRATION_SAMPLE_TIME_MS / 1000
-    drift_speed = round(sum << EXTRA_PRECISION) / calibration_time_s
-    angle = 0  # Stored as 1024 * angle-in-millidegrees
+    # drift is degrees/sec (or millidegrees/ms) << PRECBITS
+    # Note that during the angle update, this number (if non-zero)
+    # is multiplied by dt, which is in milliseconds. That means
+    # we can add it to speed, and then multiply the result by dt
+    # to get the angle change per loop.
+    drift_rate = (sum << PRECBITS) // (CALIBRATION_TIME_MS // 1000)
+    print(drift_rate)
 
-    # Every time we sample the speed of the gyro, we'll update the average drift
-    # as an exponentially weighted moving average of the speed.
-    DRIFT_UPDATE_NUM, DRIFT_UPDATE_DENOM = make_log2_ratio(
-        0.00005, 90 * EXTRA_PRECISION
+    # angle is in millidegrees << PRECBITS
+    angle = 0  # Stored as 1024 * angle-in-decidegrees
+
+    # Scale millidegrees << PRECBITS to decidegrees (10), which is our output unit.
+    # We are allowing a higher error here -- being off by 5% is not too bad when
+    # our total angles are so small and compensated for by PID tuning anyway.
+    ANGLE_OUT_NUM, ANGLE_OUT_SHR = make_log2_ratio(
+        10 / (SCALE << PRECBITS), 360 * SCALE << PRECBITS, goodrelerr=0.05
     )
 
-    def sample(dt: int):
-        nonlocal angle, drift_speed
-        speed = gyro.speed() << EXTRA_PRECISION
+    DRIFT_UPDATE_FRAC = 0.0001
+    DRIFT_UPDATE_FREQ = const(20)
 
-        if drift_speed != 0:
+    until_drift_update = DRIFT_UPDATE_FREQ
+
+    @micropython.native
+    def sample(dt: int):
+        nonlocal angle, drift_rate, until_drift_update
+        # Speed is millidegrees/ms.
+        speed = (gyro.speed() * SPEED_SCALE_NUM) >> SPEED_SCALE_SHR
+
+        if drift_rate != 0:
             # Gradually update the drift rate with the average of observed speeds.
             # The assumption here is that the average speed should be zero so to the
             # extent we see non-average speeds, we're drifting. If we found absolutely
             # zero drift during initial calibration, don't update the fraction.
-            speed -= drift_speed
-            drift_speed = (
-                drift_speed
-                - log2_ratio_mul(drift_speed, DRIFT_UPDATE_NUM, DRIFT_UPDATE_DENOM)
-            ) + log2_ratio_mul(speed, DRIFT_UPDATE_NUM, DRIFT_UPDATE_DENOM)
+            speed -= drift_rate
+            until_drift_update -= 1
+            if until_drift_update == 0:
+                until_drift_update = DRIFT_UPDATE_FREQ
+                new_drift_rate = float(drift_rate)
+                new_drift_rate *= 1 - DRIFT_UPDATE_FRAC
+                new_drift_rate += DRIFT_UPDATE_FRAC * speed
+                drift_rate = int(new_drift_rate)
 
-        # Unlikely to overflow here -- speed might be on the order of 360000 at the high
-        # end and dt could be as much as 100, but that will still be well under 16B.
-        angle += (speed * dt) >> EXTRA_PRECISION
-        return angle
+        angle += speed * dt
+
+        # Scale angle to the output unit, including shifting away the precision.
+        return (angle * ANGLE_OUT_NUM) >> ANGLE_OUT_SHR
 
     return sample
 
@@ -144,50 +167,53 @@ def main_loop():
     # roll itself off the stand. The travel is the sum of the leg travel so.
     desired_motor_angle_sum = 720
 
-    # All angles are deci (tenth) degrees.
-    # Angular velocities are tenth degrees per second.
-    # All times are milliseconds, except ticks, which are microseconds.
-
-    def motor_angle_sum():
-        return 1000 * (lleg.angle() + rleg.angle())
+    @micropython.native
+    def current_motor_angle_sum() -> int:
+        # Motor angles are measured in whole degrees, since there's not
+        # as much precision here.
+        return lleg.angle() + rleg.angle()
 
     angle = 0
     motor_angle_history = Smoother()
     motor_angle_history_length = len(motor_angle_history)
 
-    def get_smoothed_motor_angular_velocity(dt: int):
-        newest = motor_angle_sum()
+    @micropython.native
+    def motor_velocity_deg_per_sec(dt: int) -> int:
+        newest = current_motor_angle_sum()
         oldest = motor_angle_history.oldest()
         motor_angle_history.add(newest)
-        # Note: velocity is tenth degrees per second. The angle diff is already in
-        # millidegrees. dt is milliseconds, dividing the two gives degrees per second.
-        # To get decidegrees, we multiply by 10. This gives us a bit more precision
-        # without making us use too low of a gain in the PID.
-        return 10 * (newest - oldest) // (motor_angle_history_length * dt)
+        angle_diff = newest - oldest
+        # If we're doing less than 1 degree per sec, we'll report zero.
+        # We can't actually drive these motors that slow consistently so
+        # zero is probably more right than wrong.
+        # We're assuming dt is relatively steady when we multiply it here.
+        return (
+            angle_diff * dt * motor_angle_history_length // 1000
+        )  # Note dt is milli so divide by 1000.
 
     # For initial testing, we want a motorspeed of zero. The angle
-    # will controll the motor speed.
+    # will control the motor speed.
     angle_by_motorspeed = IntPID(
         0,
-        gain=1,
-        integral_time=100,  # 100ms
-        min=-450,  # -45 degrees
-        max=450,  # 45 degrees
-        max_expected_abs_err=3600,  # 360 degrees/sec
-        logname="anglepid",
+        # Tilt 2 degrees for every 100 degrees/sec we're running more than target.
+        gain=2 / 100,
+        min=-450,  # -45 decidegrees -- target angle is measured in higher precision.
+        max=450,  # 45 decidegrees
+        max_expected_abs_err=720,  # 360 degrees/sec
+        # logname="anglepid",
     )
 
-    target_angle = 5  # 0.5 deg
+    target_angle = 0  # 0.5 deg
     pid = IntPID(
         target_angle,
-        gain=100 / 2500,  # We want 100% power when we're off by more than 2.5 degrees
+        gain=100 / 250,  # We want 100% power when we're off by more than 2.5 degrees
         integral_time=500,  # ms integration time
         derivative_time=0,  # ms derivative time
         min=-100,
         max=100,
         maxdt=100,  # 100ms
         max_expected_abs_err=90000,  # 90 deg
-        # logname="mainpid",
+        logname="mainpid",
     )
 
     first_t = t = utime.ticks_us()
@@ -203,7 +229,7 @@ def main_loop():
             continue
         t = utime.ticks_add(t, dt_ms * 1000)
 
-        angle = get_angle(dt_ms)
+        angle_decideg = get_angle(dt_ms)
 
         # Compute the desired motor angular velocity. We want have a revolution per
         # second toward the desired position when the motor is 4 full revolutions away
@@ -221,13 +247,14 @@ def main_loop():
 
         angle_by_motorspeed.setpoint = 0
         target_angle = angle_by_motorspeed.update(
-            get_smoothed_motor_angular_velocity(dt_ms), dt_ms
+            motor_velocity_deg_per_sec(dt_ms), dt_ms
         )
 
         # If we want to tilt toward the positive angle, we need to drive the wheels
         # in reverse, hence the negative.
-        pid.setpoint = target_angle
-        output = -pid.update(angle, dt_ms)
+        # pid.setpoint = target_angle
+        pid.setpoint = 5  # .5 degrees forward
+        output = -pid.update(angle_decideg, dt_ms)
 
         lleg.dc(output)
         rleg.dc(output)
