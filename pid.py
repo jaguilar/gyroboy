@@ -319,8 +319,12 @@ class IntPID:
             self._buf_next = buf_next
 
             derr = err - err_buf[buf_next]
-            dt_deriv = sum(t_buf)
-
+            dt_deriv = 0
+            i = 0
+            il = len(t_buf)
+            while i < il:
+                i += 1
+                dt_deriv += t_buf[i]
             d = derr * kd_num // (dt_deriv << kd_shr)
 
         output = p + i + d
