@@ -323,8 +323,8 @@ class IntPID:
             i = 0
             il = len(t_buf)
             while i < il:
-                i += 1
                 dt_deriv += t_buf[i]
+                i += 1
             d = derr * kd_num // (dt_deriv << kd_shr)
 
         output = p + i + d
