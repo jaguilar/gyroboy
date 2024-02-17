@@ -170,6 +170,9 @@ def log2_ratio_mul(n: int, num: int, shr: int) -> int:
     return (n * num) >> shr
 
 
+_DERIV_WINDOW_SAMPLES = const(4)
+
+
 class IntPID:
     """A PID controller that uses integer math and viper to hopefully be a little faster.
 
@@ -180,8 +183,6 @@ class IntPID:
 
     We generally expect the unit of dt to be milliseconds.
     """
-
-    errbuf_len = const(4)
 
     def __init__(
         self,
@@ -243,11 +244,11 @@ class IntPID:
         # Data for derivative part.
         self._kd_num, self._kd_shr = 0, 0
         if derivative_time != 0:
-            self._err_buf = u4_array(IntPID.errbuf_len)  # 4 samples, 32 bits wide
-            self._t_buf = u4_array(IntPID.errbuf_len)  # 4 samples, 32 bits wide
+            self._err_buf = u4_array(_DERIV_WINDOW_SAMPLES)
+            self._t_buf = u4_array(_DERIV_WINDOW_SAMPLES)
             self._buf_next = 0
             # Incorporate the errbuf len divide into the ratio.
-            derivative_time /= IntPID.errbuf_len
+            derivative_time /= _DERIV_WINDOW_SAMPLES
             self._kd_num, self._kd_shr = make_log2_ratio(
                 gain * derivative_time, 2 * max_expected_abs_err * maxdt, maxrelerr
             )
@@ -313,7 +314,7 @@ class IntPID:
 
             # Make buf_next point to the oldest value -- the one to next be overwritten.
             buf_next += 1
-            if buf_next >= IntPID.errbuf_len:
+            if buf_next >= _DERIV_WINDOW_SAMPLES:
                 buf_next = 0
 
             self._buf_next = buf_next
@@ -321,8 +322,7 @@ class IntPID:
             derr = err - err_buf[buf_next]
             dt_deriv = 0
             i = 0
-            il = len(t_buf)
-            while i < il:
+            while i < _DERIV_WINDOW_SAMPLES:
                 dt_deriv += t_buf[i]
                 i += 1
             d = derr * kd_num // (dt_deriv << kd_shr)
