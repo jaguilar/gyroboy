@@ -7,7 +7,6 @@ from micropython import const
 import sys
 
 is_micropython = sys.implementation.name == "micropython"
-ptr32 = (lambda x: x) if not is_micropython else ptr32
 
 u4_array = lambda x: bytearray(4 * x) if is_micropython else [0] * x
 
@@ -166,11 +165,47 @@ def make_log2_ratio(f: float, input_magnitude: float, goodrelerr=0.001):
 
 
 @micropython.viper
-def log2_ratio_mul(n: int, num: int, shr: int) -> int:
-    return (n * num) >> shr
+def viper_set(b, off: int, n: int):
+    ba = ptr32(b)
+    ba[off] = n
+
+
+@micropython.viper
+def viper_get(b, off: int) -> int:
+    ba = ptr32(b)
+    return int(ba[off])
+
+
+class ViperArrayAccessor:
+    def __init__(self, a: bytearray):
+        self._a = a
+
+    def __setitem__(self, key, value):
+        viper_set(self._a, key, value)
+
+    def __getitem__(self, key):
+        return viper_get(self._a, key)
 
 
 _DERIV_WINDOW_SAMPLES = const(4)
+
+
+# Each variable in IntPID is stored in a bytearray for faster access during the update function.
+_KP_NUM = const(0)
+_KP_SHR = const(1)
+_MIN = const(2)
+_MAX = const(3)
+_SETPOINT = const(4)
+_KI_NUM = const(5)
+_KI_SHR = const(6)
+_ERRSUM = const(7)
+_KD_NUM = const(8)
+_KD_SHR = const(9)
+_BUF_NEXT = const(10)
+_T_BUF = const(11)  # Note: 4 32-bit entries
+_ERR_BUF = const(15)  # Note: 4 32-bit entries
+_STORE_INTERMEDIATE = const(19)
+_NUM_VARS = const(20)
 
 
 class IntPID:
@@ -214,17 +249,23 @@ class IntPID:
         logfunc: Callable -- called with t, setpoint, observation, p, i, d, output every logfreq ts.
         maxrelerr: The maximum calculated relative error between the requested k values and their integer ratio approximations.
         """
-        self._kp_num, self._kp_shr = make_log2_ratio(
+        self._data = bytearray(4 * _NUM_VARS)
+        self._slow_data_reader = data = ViperArrayAccessor(self._data)
+
+        data[_KP_NUM], data[_KP_SHR] = make_log2_ratio(
             gain, max_expected_abs_err, maxrelerr
         )
 
-        self._min = min
-        self._max = max
-        self.setpoint = setpoint
+        self._intermediates = bytearray(3 * 4)
+        self._intermediates_access = ViperArrayAccessor(self._intermediates)
+
+        data[_MIN] = min
+        data[_MAX] = max
+        data[_SETPOINT] = setpoint
 
         # Data for integral part.
 
-        self._ki_num, self._ki_shr, self._errsum = 0, 0, 0
+        data[_KI_NUM], data[_KI_SHR], data[_ERRSUM] = 0, 0, 0
         if integral_time != 0:
             ki = gain / integral_time
             # Determine the largest possible integrator multiplier we're going to face.
@@ -235,27 +276,22 @@ class IntPID:
             # The error sum needs to be
             output_range = max - min
             max_i = output_range
-            self._max_errsum = int(max_i / ki)
-            self._ki_num, self._ki_shr = make_log2_ratio(
-                ki, self._max_errsum, maxrelerr
-            )
-            self._errsum = 0
+            max_errsum = int(max_i / ki)
+            data[_KI_NUM], data[_KI_SHR] = make_log2_ratio(ki, max_errsum, maxrelerr)
 
         # Data for derivative part.
-        self._kd_num, self._kd_shr = 0, 0
+        data[_KD_NUM], data[_KD_SHR] = 0, 0
         if derivative_time != 0:
-            self._err_buf = u4_array(_DERIV_WINDOW_SAMPLES)
-            self._t_buf = u4_array(_DERIV_WINDOW_SAMPLES)
-            self._buf_next = 0
+            data[_BUF_NEXT] = 0
             # Incorporate the errbuf len divide into the ratio.
             derivative_time /= _DERIV_WINDOW_SAMPLES
-            self._kd_num, self._kd_shr = make_log2_ratio(
+            data[_KD_NUM], data[_KD_SHR] = make_log2_ratio(
                 gain * derivative_time, 2 * max_expected_abs_err * maxdt, maxrelerr
             )
 
         self._nextlog = self._t = 0
         self._logfreq = logfreq
-        self._store_intermediate = False
+        data[_STORE_INTERMEDIATE] = False
         if logfunc:
             self._logfunc = logfunc
         elif logname is not None:
@@ -272,90 +308,95 @@ class IntPID:
                 name=logname,
                 timestamp=False,
             )
-            self._logfunc = log.log
+            self._logfunc = lambda *args: log.log(*args)
         else:
             self._logfunc = None
 
-    @micropython.native
-    def _update(self, measured: int, dt: int):
+    def set_setpoint(self, newvalue: int):
+        self._slow_data_reader[_SETPOINT] = newvalue
+
+    @micropython.viper
+    def _update(self, measured: int, dt: int) -> int:
         """Update the PID controller.
 
         measured: The measured value of the system.
         dt: The change in time, in seconds.
         """
-
-        kp_num, kp_shr, ki_num, ki_shr, kd_num, kd_shr = (
-            int(self._kp_num),
-            int(self._kp_shr),
-            int(self._ki_num),
-            int(self._ki_shr),
-            int(self._kd_num),
-            int(self._kd_shr),
-        )
-
-        err = int(self.setpoint) - int(measured)
+        data = ptr32(self._data)
+        err = data[_SETPOINT] - int(measured)
         p = 0
-        if kp_num != 0:
-            p = err * kp_num
-            p >>= kp_shr
+        if data[_KP_NUM] != 0:
+            p = err * data[_KP_NUM]
+            p >>= data[_KP_SHR]
 
         i = 0
-        errsum = int(self._errsum)
-        if ki_num != 0:
+        errsum = data[_ERRSUM]
+        if data[_KI_NUM] != 0:
             errsum += err * dt
-            i = (errsum * ki_num) >> ki_shr
+            i = errsum * data[_KI_NUM]
+            i >>= data[_KI_SHR]
 
         d = 0
-        if kd_num != 0:
-            err_buf, t_buf = ptr32(self._err_buf), ptr32(self._t_buf)
-            buf_next = int(self._buf_next)
-            t_buf[buf_next] = dt
-            err_buf[buf_next] = err
+        if data[_KD_NUM] != 0:
+            buf_next = data[_BUF_NEXT]
+            data[_T_BUF + buf_next] = dt
+            data[_ERR_BUF + buf_next] = err
 
             # Make buf_next point to the oldest value -- the one to next be overwritten.
             buf_next += 1
-            if buf_next >= _DERIV_WINDOW_SAMPLES:
+            if buf_next == _DERIV_WINDOW_SAMPLES:
                 buf_next = 0
-
-            self._buf_next = buf_next
-
-            derr = err - err_buf[buf_next]
+            data[_BUF_NEXT] = buf_next
+            olderr = data[_ERR_BUF + buf_next]
+            derr = err - olderr
             dt_deriv = 0
-            i = 0
-            while i < _DERIV_WINDOW_SAMPLES:
-                dt_deriv += t_buf[i]
-                i += 1
-            d = derr * kd_num // (dt_deriv << kd_shr)
+            idx = 0
+            while idx < _DERIV_WINDOW_SAMPLES:
+                dt_deriv += data[_T_BUF + idx]
+                idx += 1
+            # Note that shifting right is the same as dividing by a left-shifted value.
+            d = derr * data[_KD_NUM]
+            d //= dt_deriv << data[_KD_SHR]
 
         output = p + i + d
-        min, max = self._min, self._max
+        min, max = int(data[_MIN]), int(data[_MAX])
         if output < min:
             output = min
             errsum -= err * dt  # Anti-windup clamping.
         elif output > max:
             output = max
             errsum -= err * dt
-
         # Write-back errsum.
-        self._errsum = errsum
+        data[_ERRSUM] = errsum
 
-        if self._store_intermediate:
-            self._p, self._i, self._d = p, i, d
+        if data[_STORE_INTERMEDIATE] != 0:
+            ba = ptr32(self._intermediates)
+            ba[0], ba[1], ba[2] = p, i, d
         return output
 
     def update(self, measured: int, dt: int):
+        store_intermediate = False
         if self._logfunc:
             self._t += dt
             if self._t > self._nextlog:
                 self._nextlog += self._logfreq
-                self._store_intermediate = True
-
+                store_intermediate = True
+                self._slow_data_reader[_STORE_INTERMEDIATE] = 1
         output = self._update(measured, dt)
-
-        if self._logfunc is not None and self._store_intermediate:
+        if self._logfunc is not None and store_intermediate:
+            setpoint = self._slow_data_reader[_SETPOINT]
+            p = self._intermediates_access[0]
+            i = self._intermediates_access[1]
+            d = self._intermediates_access[2]
             self._logfunc(
-                self._t, self.setpoint, measured, self._p, self._i, self._d, output
+                self._t,
+                setpoint,
+                measured,
+                p,
+                i,
+                d,
+                output,
             )
-            self._store_intermediate = False
+            self._slow_data_reader[_STORE_INTERMEDIATE] = 0
 
         return output

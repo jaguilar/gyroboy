@@ -50,7 +50,7 @@ def test_intpid():
 
     pid = IntPID(
         setpoint=545,
-        kp=250,
+        gain=250,
         max_expected_abs_err=400,
         integral_time=60,
         derivative_time=6,

@@ -15,7 +15,7 @@ from pybricks.tools import wait, StopWatch, DataLog
 from pybricks.robotics import DriveBase
 from pybricks.messaging import Mailbox, BluetoothMailboxServer
 from pybricks.media.ev3dev import SoundFile, ImageFile
-from pid import PID, IntPID, Smoother, make_log2_ratio, log2_ratio_mul
+from pid import PID, IntPID, Smoother, make_log2_ratio
 import micropython
 from micropython import const
 import struct
@@ -45,7 +45,7 @@ rleg = Motor(Port.A)
 lleg = Motor(Port.D)
 arm = Motor(Port.C)
 
-target_loop_ms = 5
+_TARGET_LOOP_MS = const(5)
 
 
 @micropython.viper
@@ -62,54 +62,14 @@ ANGLE_SCALE = const(10)  # Decidegrees
 # Returns a function that, given a dt, reports the angle of the gyro in millidegrees.
 def get_calibrated_angle_speed():
     """Returns a tuple of (angle, speed) of the gyro, both floats."""
-    CALIBRATION_TIME_MS = const(2000)
-    CALIBRATION_SAMPLE_TIME_MS = const(15)
-    DRIFTPREC = const(10)
-    SCALE = const(10)
-
-    sum, count = 0, 0
-    for _ in range(count):
-        sum += gyro.speed()
-        wait(CALIBRATION_SAMPLE_TIME_MS)
-
-    # drift is decidegrees/sec (or millidecidegrees/ms) << PRECBITS
-    # Note that during the angle update, this number (if non-zero)
-    # is multiplied by dt, which is in milliseconds. That means
-    # we can add it to speed, and then multiply the result by dt
-    # to get the angle change per loop.
-    drift_rate = (sum // (CALIBRATION_TIME_MS // 1000)) << DRIFTPREC
-    print(drift_rate)
-
-    # angle is in millidegrees << PRECBITS
-    angle = 0  # Stored as 1024 * angle-in-decidegrees
-
-    DRIFT_UPDATE_FRAC = 0.0001
-    DRIFT_UPDATE_FREQ = const(20)
-
-    until_drift_update = DRIFT_UPDATE_FREQ
+    angle = 0  # Stored as angle-in-decidegrees
 
     @micropython.native
     def sample(dt: int):
-        nonlocal angle, drift_rate, until_drift_update
+        nonlocal angle
         # Modulo the bonus precision, speed is multiplied by 10 (decidegrees/sec).
         speed = gyro.speed()
-
-        if False:  # drift_rate != 0:
-            # Gradually update the drift rate with the average of observed speeds.
-            # The assumption here is that the average speed should be zero so to the
-            # extent we see non-average speeds, we're drifting. If we found absolutely
-            # zero drift during initial calibration, don't update the fraction.
-            speed -= drift_rate >> DRIFTPREC
-            until_drift_update -= 1
-            if until_drift_update == 0:
-                until_drift_update = DRIFT_UPDATE_FREQ
-                new_drift_rate = float(drift_rate)
-                new_drift_rate *= 1 - DRIFT_UPDATE_FRAC
-                new_drift_rate += DRIFT_UPDATE_FRAC * (speed << DRIFTPREC)
-                drift_rate = int(new_drift_rate)
-
         angle += speed * dt
-
         # Scale angle to the output unit, including shifting away the precision.
         return angle // 100
 
@@ -120,14 +80,18 @@ left_right = 0
 forward_backward = 0
 
 
-server = BluetoothMailboxServer()
-print("waiting for connection")
-server.wait_for_connection(1)
-mailbox = Mailbox(config.direction_channel, server)
-
-
+# Honestly the controller doesn't work that well. It has a detectable effect, but
+# I haven't been able to find a tune of the PID controller that is both responsive
+# and doesn't lead to wild oscillations. Possibly because the system we're controlling
+# is not very linear and PID is a linear controller? I don't know.
 def serve():
     global left_right, forward_backward
+
+    server = BluetoothMailboxServer()
+    print("waiting for connection")
+    server.wait_for_connection(1)
+    mailbox = Mailbox(config.direction_channel, server)
+
     i = 0
     while True:
         data = mailbox.read()
@@ -139,7 +103,6 @@ def serve():
             left_right //= 10  # Proportional drive max 10%
             forward_backward = 0 - forward_backward
             if i == 10:
-                print(left_right, forward_backward)
                 i = 0
         i += 1
 
@@ -152,21 +115,23 @@ def main_loop():
     get_angle = get_calibrated_angle_speed()
     ev3.speaker.beep()
 
-    # We want the motors to rotate forward one full revolution. I.e. the robot should
-    # roll itself off the stand. The travel is the sum of the leg travel so.
-    desired_motor_angle_sum = 720
+    _DEGREES_PER_REVOLUTION = const(720)
 
-    @micropython.viper
+    # We want the motors to rotate forward a bit to get the machine off its pylon.
+    # Because of the latencies in the controllers, this doesn't work as well as
+    # you might hope, at least not on my unlevel basement floor.
+    desired_motor_angle_sum = 2 * _DEGREES_PER_REVOLUTION
+
     def current_motor_angle_sum() -> int:
         # Motor angles are measured in whole degrees, since there's not
         # as much precision here.
         return int(lleg.angle()) + int(rleg.angle())
 
-    angle = 0
     motor_angle_history = Smoother()
     motor_angle_history_length = len(motor_angle_history)
 
-    @micropython.viper
+    _MAX_REQUESTED_SPEED = const(400)  # 200 degrees per second per wheel.
+
     def motor_velocity_deg_per_sec(dt: int) -> int:
         newest = int(current_motor_angle_sum())
         oldest = int(motor_angle_history.oldest())
@@ -175,34 +140,30 @@ def main_loop():
         # If we're doing less than 1 degree per sec, we'll report zero.
         # We can't actually drive these motors that slow consistently so
         # zero is probably more right than wrong.
-
         return angle_diff * 1000 // (dt * int(motor_angle_history_length))
 
-    # For initial testing, we want a motorspeed of zero. The angle
-    # will control the motor speed.
     angle_by_motorspeed = IntPID(
         0,
-        # Tilt 2 degrees for every 100 degrees/sec we're running more than target.
-        gain=0.75 / 100,
-        integral_time=500,
-        derivative_time=75,
+        gain=1.25 / 100,
+        integral_time=800,
+        derivative_time=100,
         min=-150,  # -45 decidegrees -- target angle is measured in higher precision.
         max=150,  # 45 decidegrees
-        max_expected_abs_err=720,  # 360 degrees/sec
+        max_expected_abs_err=_MAX_REQUESTED_SPEED * 4,
         # logname="anglepid",
     )
 
     target_angle = 5
     pid = IntPID(
         target_angle,
-        gain=1.25,  # We want 100% power when we're off by more than .75 degrees
-        integral_time=125,  # ms integration time
-        derivative_time=50,  # ms derivative time
+        gain=1.5,
+        integral_time=190,  # ms integration time
+        derivative_time=20,  # ms derivative time
         min=-100,
         max=100,
         maxdt=100,  # 100ms
         max_expected_abs_err=90000,  # 90 deg
-        # logname="mainpid",
+        logname="mainpid",
     )
 
     first_t = t = utime.ticks_us()
@@ -218,33 +179,44 @@ def main_loop():
             continue
         t = utime.ticks_add(t, dt_ms * 1000)
 
-        forward_rate = forward_backward * 7 * dt_ms // 1000
-        desired_motor_angle_sum += forward_rate
-
+        # If forward is 100, then we'll ask for 200 degrees per second forward.
         angle_decideg = get_angle(dt_ms)
+        desired_speed = forward_backward * 2
 
-        # Compute the desired motor angular velocity. We want have a revolution per
-        # second toward the desired position when the motor is 4 full revolutions away
-        # from the desired position, and no more. We linearly interpolate between that
-        # speed and zero when the motor is close to its initial position.
-        # (This is just a P controller, but it's simpler to do it here in plain code.)
+        current_motor_sum = current_motor_angle_sum()
+        if desired_speed < 5:
+            # No speed request, try to stay at the same position.
+            sum_diff = desired_motor_angle_sum - current_motor_sum
 
-        deci_revolutions_from_desired_position = (
-            10 * (desired_motor_angle_sum - current_motor_angle_sum()) // (4 * 720)
-        )
-        # Note that 360 means half a revolution, since it's the sum of the angles.
-        desired_speed = clamp(deci_revolutions_from_desired_position * 40, -720, 720)
+            millirevolutions_err = sum_diff * 1000 // _DEGREES_PER_REVOLUTION
 
-        angle_by_motorspeed.setpoint = int(desired_speed)
+            _1_PCT_SPEED_MILLIREVOLUTIONS = 30  # 3 revolutions for max / 100 pct
+            _1_PCT_MAX_SPEED = 4
+
+            desired_speed = (
+                millirevolutions_err * _1_PCT_MAX_SPEED // _1_PCT_SPEED_MILLIREVOLUTIONS
+            )
+            if desired_speed > _MAX_REQUESTED_SPEED:
+                desired_speed = _MAX_REQUESTED_SPEED
+            if desired_speed < -_MAX_REQUESTED_SPEED:
+                desired_speed = -_MAX_REQUESTED_SPEED
+
+        else:
+            # Speed is controlled by the controller. Update the desired position to
+            # our current position.
+            desired_motor_angle_sum = current_motor_sum
+
+        angle_by_motorspeed.set_setpoint(int(desired_speed))
         target_angle = angle_by_motorspeed.update(
             motor_velocity_deg_per_sec(dt_ms), dt_ms
         )
 
         # If we want to tilt toward the positive angle, we need to drive the wheels
         # in reverse, hence the negative.
-        pid.setpoint = target_angle
-        # pid.setpoint = 5  # .5 degrees forward
+        pid.set_setpoint(target_angle)
         output = -pid.update(angle_decideg, dt_ms)
+
+        angle_err = target_angle - angle_decideg
 
         lleg.dc(output + left_right)
         rleg.dc(output - left_right)
@@ -257,14 +229,14 @@ def main_loop():
                 % (utime.ticks_diff(t, first_t) / 1000 / nloops, dt_ms)
             )
             return
-        if angle > 20000:
+        if angle_err > 100 or angle_err < -100:
             print(
                 "angle limit exceeded, we crashed! %d loop time ms avg %d most recent"
                 % (utime.ticks_diff(t, first_t) / 1000 / nloops, dt_ms)
             )
             return
 
-        wait_ms = target_loop_ms - dt_ms
+        wait_ms = _TARGET_LOOP_MS - dt_ms
         if wait_ms > 0:
             wait(wait_ms)
         nloops += 1
