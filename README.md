@@ -2,7 +2,7 @@
 
 My take on LEGO's gyroboy project for the EV3.
 
-<iframe width="560" height="315" src="https://www.youtube.com/embed/sPfzWnu0Gz4?si=SmgIr4S0IDI0JnN1" title="YouTube video player" frameborder="0" allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share" allowfullscreen></iframe>
+https://github.com/jaguilar/gyroboy/assets/799564/7a09d942-e44e-4272-b6c3-2ca7feb5c35d
 
 Yeah, I mean, it's okay? I made it "controllable" by a PC controller (see
 control.py). The control is not very responsive and is prone to causing things
