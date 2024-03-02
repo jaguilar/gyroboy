@@ -5,7 +5,6 @@ project(pybricks_ev3_ffi_demo)
 cmake_policy(SET CMP0069 NEW) 
 set(CMAKE_POLICY_DEFAULT_CMP0069 NEW)
 
-
 MESSAGE(WARNING "Using toolchain file: ${CMAKE_TOOLCHAIN_FILE}")
 MESSAGE(WARNING "Binary dir: ${CMAKE_BINARY_DIR}")
 

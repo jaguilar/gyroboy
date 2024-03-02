@@ -15,7 +15,8 @@ from pybricks.tools import wait, StopWatch, DataLog
 from pybricks.robotics import DriveBase
 from pybricks.messaging import Mailbox, BluetoothMailboxServer
 from pybricks.media.ev3dev import SoundFile, ImageFile
-from pid import PID, IntPID, Smoother, make_log2_ratio
+from pid import Smoother
+from pid_wrap import PID
 import micropython
 from micropython import const
 import struct
@@ -142,8 +143,7 @@ def main_loop():
         # zero is probably more right than wrong.
         return angle_diff * 1000 // (dt * int(motor_angle_history_length))
 
-    angle_by_motorspeed = IntPID(
-        0,
+    angle_by_motorspeed = PID(
         gain=1.25 / 100,
         integral_time=800,
         derivative_time=100,
@@ -154,8 +154,7 @@ def main_loop():
     )
 
     target_angle = 5
-    pid = IntPID(
-        target_angle,
+    pid = PID(
         gain=1.5,
         integral_time=190,  # ms integration time
         derivative_time=20,  # ms derivative time
@@ -206,15 +205,15 @@ def main_loop():
             # our current position.
             desired_motor_angle_sum = current_motor_sum
 
-        angle_by_motorspeed.set_setpoint(int(desired_speed))
         target_angle = angle_by_motorspeed.update(
-            motor_velocity_deg_per_sec(dt_ms), dt_ms
+            dt=dt_ms,
+            setpoint=int(desired_speed),
+            measurement=motor_velocity_deg_per_sec(dt_ms),
         )
 
         # If we want to tilt toward the positive angle, we need to drive the wheels
         # in reverse, hence the negative.
-        pid.set_setpoint(target_angle)
-        output = -pid.update(angle_decideg, dt_ms)
+        output = -pid.update(dt=dt_ms, setpoint=target_angle, measurement=angle_decideg)
 
         angle_err = target_angle - angle_decideg
 

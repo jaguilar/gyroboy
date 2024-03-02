@@ -49,10 +49,10 @@ typedef struct jags_ratio {
   int32_t log2_denom;
 } jags_ratio;
 
-double jags_calculate_relative_error(double target, int32_t num,
-                                     int32_t log2_denom) {
-  const double found = 1.0 * num / (1 << log2_denom);
-  const double err = fabs(found - target) / target;
+float jags_calculate_relative_error(float target, int32_t num,
+                                    int32_t log2_denom) {
+  const float found = 1.0 * num / (1 << log2_denom);
+  const float err = fabs(found - target) / target;
   printf("%f %d/%d %f\n", target, num, 1 << log2_denom, err);
   return err;
 }
@@ -60,10 +60,10 @@ double jags_calculate_relative_error(double target, int32_t num,
 // Initialize the ratio with the closest numerator and log2_denom to the target
 // value. Asserts that the ratio is with the tolerance provided. (This isn't
 // very good as a general approach but it will be okay for this.)
-bool jags_ratio_init(jags_ratio *ratio, double target, int32_t max_input,
-                     double tolerance) {
+bool jags_ratio_init(jags_ratio *ratio, float target, int32_t max_input,
+                     float tolerance) {
   printf("%f %d %f\n", target, max_input, tolerance);
-  const double quit_early = tolerance / 10;
+  const float quit_early = tolerance / 10;
   ratio->log2_denom = 0;
   ratio->num = 0;
   if (target == 0.0) {
@@ -72,15 +72,14 @@ bool jags_ratio_init(jags_ratio *ratio, double target, int32_t max_input,
 
   const int32_t max_num_times_input = INT32_MAX;
   int32_t num = (int32_t)target;
-  double bestrelerr = 1.0;
+  float bestrelerr = 1.0;
   for (int32_t log2_denom = 0; log2_denom < 32; ++log2_denom) {
     const int32_t denom = 1 << log2_denom;
     num = round(target * denom);
     if (1.0 * num * max_input > max_num_times_input) {
       break;
     }
-    const double relerr =
-        jags_calculate_relative_error(target, num, log2_denom);
+    const float relerr = jags_calculate_relative_error(target, num, log2_denom);
     if (relerr < bestrelerr) {
       ratio->num = num;
       ratio->log2_denom = log2_denom;
@@ -118,36 +117,29 @@ typedef struct jags_pid {
   int32_t logfreq, nextlog, time;
 } jags_pid;
 
-extern void *jags_pid_new(double gain, double integration_time,
-                          double derivative_time, int32_t min_output,
+extern void *jags_pid_new(float gain, float integration_time,
+                          float derivative_time, int32_t min_output,
                           int32_t max_output, int32_t max_expected_err,
                           const char *logfile_name, int32_t max_dt,
-                          double max_ratio_error, int32_t logfreq) {
+                          float max_ratio_error, int32_t logfreq) {
   jags_pid *pid = (jags_pid *)malloc(sizeof(jags_pid));
   pid->logfile = 0;
 
   if (!jags_ratio_init(&pid->kp_r, gain, max_expected_err, max_ratio_error)) {
     goto err;
   }
-  if (integration_time > 0) {
-    if (!jags_ratio_init(&pid->ki_r, gain / integration_time, max_expected_err,
-                         max_ratio_error)) {
-      goto err;
-    }
-  } else {
-    pid->ki_r.num = 0;
+  if (!jags_ratio_init(&pid->ki_r, gain / integration_time, max_expected_err,
+                       max_ratio_error)) {
+    goto err;
   }
-  if (derivative_time > 0) {
-    if (!jags_ratio_init(&pid->kd_r, gain * derivative_time,
-                         2 * max_expected_err, max_ratio_error)) {
-      goto err;
-    }
-  } else {
-    pid->kd_r.num = 0;
+  if (!jags_ratio_init(&pid->kd_r, gain * derivative_time, 2 * max_expected_err,
+                       max_ratio_error)) {
+    goto err;
   }
 
   pid->min_out = min_output;
   pid->max_out = max_output;
+  pid->err_sum = 0;
   jags_ring_init(&pid->derr_samps);
   jags_ring_init(&pid->dt_samps);
 
@@ -199,7 +191,9 @@ extern int32_t jags_pid_update(void *pid_void, int32_t dt, int32_t setpoint,
   if (dt > 0) {
     const int32_t derr_diff = jags_ring_diff(&pid->derr_samps);
     const int32_t dt_sum = jags_ring_sum(&pid->dt_samps);
-    d = jags_ratio_apply(&pid->kd_r, derr_diff) / dt_sum;
+    if (dt_sum > 0) {
+      d = jags_ratio_apply(&pid->kd_r, derr_diff) / dt_sum;
+    }
   }
 
   int32_t output = p + i + d;

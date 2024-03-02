@@ -6,7 +6,7 @@ import uctypes
 libpid = ffi.open("libpid.so")
 
 _ptr_t = "p"
-_dbl_t = "d"
+_flt_t = "f"
 _int_t = "i"
 _void_t = "v"
 
@@ -14,15 +14,15 @@ _pid_new = libpid.func(
     _ptr_t,
     "jags_pid_new",
     # TODO: jaguilar - this should be a single string.
-    _dbl_t  # gain
-    + _dbl_t  # integration_time
-    + _dbl_t  # derivative_time
+    _flt_t  # gain
+    + _flt_t  # integration_time
+    + _flt_t  # derivative_time
     + _int_t  # min_output
     + _int_t  # max_output
     + _int_t  # max_expected_err
     + _ptr_t  # logfile name
     + _int_t  # max_dt
-    + _dbl_t  # max_ratio_err
+    + _flt_t  # max_ratio_err
     + _int_t,  # logfreq
 )
 
@@ -70,51 +70,6 @@ class PID:
 
     def update(self, dt, setpoint, measurement):
         return _pid_update(self._pid, dt, setpoint, measurement)
-
-
-def test_intpid():
-    class WaterHeater:
-        j_per_g_c = 4.18
-        room_temp = 22  # celcius
-        loss_per_delta_c = 0.5 / (
-            30 * 60 * 60
-        )  # Half a degree per hour when at full temp.
-        max_power_w = 1125
-
-        def __init__(self, temp_c, mass_kg):
-            self.temp_c = temp_c
-            self._mass_kg = mass_kg
-
-        def step(self, power_w, dt_s):
-            energy = power_w * dt_s
-            self.temp_c += energy / (WaterHeater.j_per_g_c * self._mass_kg * 1000)
-            self.temp_c -= (
-                (self.temp_c - WaterHeater.room_temp)
-                * WaterHeater.loss_per_delta_c
-                * dt_s
-            )
-
-    setpoint = 545
-    pid = PID(
-        gain=250,
-        max_expected_abs_err=400,
-        integral_time=60,
-        derivative_time=6,
-        min=0,
-        max=11250,
-        maxdt=1000,
-        logname=b"intpid.csv",
-        logfreq=600,
-    )
-    wh = WaterHeater(10, 75 * 3.785)
-    for _ in range(24 * 36):
-        wh.step(
-            pid.update(dt=100, setpoint=setpoint, measurement=round(10 * wh.temp_c))
-            / 10,
-            100,
-        )
-    print(wh.temp_c)
-
 
 if __name__ == "__main__":
     test_intpid()
