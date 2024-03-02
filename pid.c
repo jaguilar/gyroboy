@@ -62,7 +62,7 @@ float jags_calculate_relative_error(float target, int32_t num,
 // very good as a general approach but it will be okay for this.)
 bool jags_ratio_init(jags_ratio *ratio, float target, int32_t max_input,
                      float tolerance) {
-  printf("%f %d %f\n", target, max_input, tolerance);
+  printf("target:%f max_input:%d tol:%f\n", target, max_input, tolerance);
   const float quit_early = tolerance / 10;
   ratio->log2_denom = 0;
   ratio->num = 0;
