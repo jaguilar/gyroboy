@@ -20,10 +20,9 @@ could estimate it over time? Maybe by looking at what happens when a given level
 motor power is applied to a given angle?
 
 I also found that pybricks was a little slow of a programming language for this
-project. You can see the contortions I had to do to get the PID controller to run
-fast enough. Even with all this effort one time through the loop takes an average of
-7ms on my EV3. (The demo code from LEGO goes faster, but, of course, it's doing a lot
-less.)
+project. I ended up rewriting the PID controller in C. (See [pid.c].) I found that this
+made the robot MUCH steadier. The average loop time went from 7-8ms to 5ms. Presumably
+the variance in the loop times is also much better controlled.
 
 It was a brilliantly fun project and a great diversion for a week of evenings. Looking
 forward to the next one.
