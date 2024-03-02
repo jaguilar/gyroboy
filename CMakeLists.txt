@@ -2,17 +2,34 @@ cmake_minimum_required(VERSION 3.7.2)
 
 project(pybricks_ev3_ffi_demo)
 
-MESSAGE(STATUS "Using toolchain file: ${CMAKE_TOOLCHAIN_FILE}")
-MESSAGE(STATUS "Binary dir: ${CMAKE_BINARY_DIR}")
+cmake_policy(SET CMP0069 NEW) 
+set(CMAKE_POLICY_DEFAULT_CMP0069 NEW)
+
+
+MESSAGE(WARNING "Using toolchain file: ${CMAKE_TOOLCHAIN_FILE}")
+MESSAGE(WARNING "Binary dir: ${CMAKE_BINARY_DIR}")
 
 set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
 set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 
-set(CMAKE_CXX_STANDARD 20)
-set(CMAKE_CXX_STANDARD_REQUIRED ON)
+MESSAGE(WARNING "${CMAKE_CXX_FLAGS}")
+set(CMAKE_C_FLAGS "-fdata-sections -ffunction-sections -Wall -Wmaybe-uninitialized")
+set(CMAKE_CXX_FLAGS "-fno-exceptions -fdata-sections -ffunction-sections")
 
-add_subdirectory(abseil-cpp)
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
-add_library(pid SHARED pid.cc)
-target_link_libraries(pid -static absl::algorithm absl::base absl::debugging absl::flat_hash_map absl::flags absl::memory absl::meta absl::numeric absl::random_random absl::strings  absl::synchronization absl::time absl::utility)
+include(GenerateExportHeader)
+add_library(pid SHARED pid.c)
+generate_export_header(pid)
+
+target_link_libraries(pid PUBLIC -Wl,--gc-sections)
+
+include(CheckIPOSupported)
+check_ipo_supported(RESULT result OUTPUT output)
+if(result)
+  # set_property(TARGET pid PROPERTY INTERPROCEDURAL_OPTIMIZATION TRUE)
+else()
+  message(WARNING "IPO is not supported: ${output}")
+endif()
+ 
