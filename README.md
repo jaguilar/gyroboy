@@ -2,6 +2,12 @@
 
 My take on LEGO's gyroboy project for the EV3.
 
+Current, with C PID controller:
+
+https://github.com/jaguilar/gyroboy/assets/799564/d14a14c5-e32a-4bad-8059-a4c31950a997
+
+Before, with Micropython-Viper PID controller:
+
 https://github.com/jaguilar/gyroboy/assets/799564/7a09d942-e44e-4272-b6c3-2ca7feb5c35d
 
 Yeah, I mean, it's okay? I made it "controllable" by a PC controller (see
